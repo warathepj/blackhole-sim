@@ -1,0 +1,18 @@
+[package]
+name = "blackhole-sim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Linear algebra / math
+nalgebra = "0.35"
+
+# UI framework (egui via eframe — wgpu backend is default in 0.35)
+eframe = "0.35"
+
+# Randomization for particles
+rand = "0.10"
+
+# Serialization/Utility for GPU buffers
+bytemuck = { version = "1.21", features = ["derive"] }
+

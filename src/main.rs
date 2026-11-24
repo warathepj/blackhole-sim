@@ -5,7 +5,7 @@ use std::sync::Arc;
 use eframe::egui;
 use eframe::egui_wgpu;
 use eframe::wgpu;
-use render::{Camera, CameraUniform, RenderResources};
+use render::{Camera, RenderResources};
 
 struct BlackHoleApp {
     sim: physics::SimulationState,
@@ -22,12 +22,9 @@ impl egui_wgpu::CallbackTrait for SimulationCallback {
         callback_resources: &egui_wgpu::CallbackResources,
     ) {
         if let Some(resources) = callback_resources.get::<RenderResources>() {
-            if resources.vertex_count > 0 && resources.vertex_buffer.is_some() {
-                render_pass.set_pipeline(&resources.pipeline);
-                render_pass.set_bind_group(0, &resources.camera_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, resources.vertex_buffer.as_ref().unwrap().slice(..));
-                render_pass.draw(0..resources.vertex_count, 0..1);
-            }
+            render_pass.set_pipeline(&resources.pipeline);
+            render_pass.set_bind_group(0, &resources.bind_group, &[]);
+            render_pass.draw(0..3, 0..1); // Draw the full screen triangle
         }
     }
 }
@@ -82,8 +79,8 @@ impl eframe::App for BlackHoleApp {
 
                     ui.add_space(8.0);
 
-                    // Particle Speed
-                    ui.label(format!("Particle Speed: {:.2}x", self.sim.params.particle_speed));
+                    // Particle Speed (acts as step speed/fidelity)
+                    ui.label(format!("Fidelity: {:.2}x", self.sim.params.particle_speed));
                     let old_speed = self.sim.params.particle_speed;
                     ui.add(egui::Slider::new(&mut self.sim.params.particle_speed, 0.1..=3.0).show_value(false));
                     if self.sim.params.particle_speed != old_speed {
@@ -92,7 +89,7 @@ impl eframe::App for BlackHoleApp {
 
                     ui.add_space(8.0);
 
-                    // Accretion Disk Density
+                    // Accretion Disk Density (mapped to brightness)
                     ui.label(format!("Disk Density: {:.2}", self.sim.params.disk_density));
                     let old_density = self.sim.params.disk_density;
                     ui.add(egui::Slider::new(&mut self.sim.params.disk_density, 0.1..=2.0).show_value(false));
@@ -127,9 +124,11 @@ impl eframe::App for BlackHoleApp {
                 ui.group(|ui: &mut egui::Ui| {
                     ui.label("Simulation Info");
                     ui.add_space(5.0);
+                    
+                    let fps = 1.0 / ui.ctx().input(|i| i.stable_dt);
+                    ui.label(format!("FPS: {:.1}", fps));
+                    
                     ui.label(format!("Time: {:.3}", self.sim.time));
-                    ui.label(format!("Active Particles: {}", self.sim.particles.len()));
-                    ui.label(format!("Disk Particles: {}", self.sim.accretion_disk.particles.len()));
                     ui.label(format!("Schwarzschild Radius: {:.2}", self.sim.black_hole.schwarzschild_radius));
                     ui.label(format!("ISCO Radius: {:.2}", self.sim.black_hole.isco_radius()));
                 });
@@ -160,20 +159,19 @@ impl eframe::App for BlackHoleApp {
                 ui.ctx().request_repaint();
             }
 
-            let view_proj = self.camera.to_view_proj(rect.width() / rect.height());
-
             // Render wgpu callback
             if let Some(render_state) = frame.wgpu_render_state() {
-                // Update vertex buffers and camera uniform on the GPU
+                // Update uniforms on the GPU
                 let mut renderer = render_state.renderer.write();
                 let callback_resources = &mut renderer.callback_resources;
                 if let Some(resources) = callback_resources.get_mut::<RenderResources>() {
-                    resources.update_particles(&render_state.device, &render_state.queue, &self.sim);
-                    
-                    let camera_uniform = CameraUniform {
-                        view_proj: view_proj.into(),
-                    };
-                    render_state.queue.write_buffer(&resources.camera_buffer, 0, bytemuck::bytes_of(&camera_uniform));
+                    resources.update_uniforms(
+                        &render_state.queue,
+                        &self.camera,
+                        &self.sim,
+                        rect.width(),
+                        rect.height(),
+                    );
                 }
 
                 // Register rendering callback using egui_wgpu::Callback

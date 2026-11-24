@@ -1,52 +1,27 @@
 use eframe::wgpu;
 use eframe::wgpu::util::DeviceExt;
-use nalgebra::{Matrix4, Point3, Vector3 as NVec3};
+use nalgebra::{Point3, Vector3 as NVec3};
 
 use crate::physics::SimulationState;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct ParticleVertex {
-    pub position: [f32; 3],
-    pub color: [f32; 4],
-    pub size: f32,
-}
-
-impl ParticleVertex {
-    pub fn desc() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<ParticleVertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-                wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: (std::mem::size_of::<[f32; 3]>() + std::mem::size_of::<[f32; 4]>() ) as wgpu::BufferAddress,
-                    shader_location: 2,
-                    format: wgpu::VertexFormat::Float32,
-                },
-            ],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct CameraUniform {
-    pub view_proj: [[f32; 4]; 4],
+pub struct LensingUniforms {
+    pub camera_pos: [f32; 3],
+    pub bh_mass: f32,
+    pub camera_forward: [f32; 3],
+    pub rs: f32,
+    pub camera_right: [f32; 3],
+    pub time: f32,
+    pub camera_up: [f32; 3],
+    pub screen_width: f32,
+    pub screen_height: f32,
+    pub _pad: [f32; 3], // padding to align total size to multiple of 16 (80 bytes)
 }
 
 pub struct Camera {
-    pub theta: f32, // Azimuthal angle
-    pub phi: f32,   // Polar angle
+    pub theta: f32,  // Azimuthal angle
+    pub phi: f32,    // Polar angle
     pub radius: f32, // Distance from center
     pub target: Point3<f32>,
 }
@@ -56,55 +31,67 @@ impl Camera {
         Self {
             theta: 0.8,
             phi: 1.2,
-            radius: 120.0,
+            radius: 80.0,
             target: Point3::origin(),
         }
     }
 
-    pub fn to_view_proj(&self, aspect_ratio: f32) -> Matrix4<f32> {
+    /// Return the camera directions: (forward, right, up, eye_position)
+    pub fn get_vectors(&self) -> (NVec3<f32>, NVec3<f32>, NVec3<f32>, Point3<f32>) {
         let x = self.radius * self.phi.sin() * self.theta.cos();
         let y = self.radius * self.phi.cos();
         let z = self.radius * self.phi.sin() * self.theta.sin();
-
         let eye = Point3::new(x, y, z);
-        let view = Matrix4::look_at_rh(&eye, &self.target, &NVec3::new(0.0, 1.0, 0.0));
-        let proj = Matrix4::new_perspective(aspect_ratio, 45.0f32.to_radians(), 0.1, 1000.0);
 
-        proj * view
+        let forward = (self.target.coords - eye.coords).normalize();
+        let world_up = NVec3::new(0.0f32, 1.0f32, 0.0f32);
+        
+        let right = forward.cross(&world_up).normalize();
+        let up = right.cross(&forward).normalize();
+
+        (forward, right, up, eye)
     }
 }
 
 pub struct RenderResources {
     pub pipeline: wgpu::RenderPipeline,
-    pub camera_buffer: wgpu::Buffer,
-    pub camera_bind_group: wgpu::BindGroup,
-    pub vertex_buffer: Option<wgpu::Buffer>,
-    pub vertex_count: u32,
+    pub uniforms_buffer: wgpu::Buffer,
+    pub bind_group: wgpu::BindGroup,
 }
 
 impl RenderResources {
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Simulation Shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("shader.wgsl"))),
+            label: Some("Lensing Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("lensing_shader.wgsl"))),
         });
 
-        // Camera Uniform Buffer
-        let camera_uniform = CameraUniform {
-            view_proj: Matrix4::identity().into(),
+        // Initialize Uniforms
+        let uniforms = LensingUniforms {
+            camera_pos: [0.0; 3],
+            bh_mass: 10.0,
+            camera_forward: [0.0; 3],
+            rs: 20.0,
+            camera_right: [0.0; 3],
+            time: 0.0,
+            camera_up: [0.0; 3],
+            screen_width: 800.0,
+            screen_height: 600.0,
+            _pad: [0.0; 3],
         };
-        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Camera Uniform Buffer"),
-            contents: bytemuck::bytes_of(&camera_uniform),
+
+        let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Lensing Uniform Buffer"),
+            contents: bytemuck::bytes_of(&uniforms),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let camera_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Camera Bind Group Layout"),
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Lensing Bind Group Layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -115,31 +102,31 @@ impl RenderResources {
             ],
         });
 
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Camera Bind Group"),
-            layout: &camera_bind_group_layout,
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Lensing Bind Group"),
+            layout: &bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: camera_buffer.as_entire_binding(),
+                    resource: uniforms_buffer.as_entire_binding(),
                 }
             ],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[Some(&camera_bind_group_layout)],
+            label: Some("Lensing Pipeline Layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Simulation Render Pipeline"),
+            label: Some("Lensing Render Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[ParticleVertex::desc()],
+                buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -147,12 +134,12 @@ impl RenderResources {
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
             primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::PointList,
+                topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: None,
@@ -168,86 +155,34 @@ impl RenderResources {
 
         Self {
             pipeline,
-            camera_buffer,
-            camera_bind_group,
-            vertex_buffer: None,
-            vertex_count: 0,
+            uniforms_buffer,
+            bind_group,
         }
     }
 
-    pub fn update_particles(&mut self, device: &wgpu::Device, _queue: &wgpu::Queue, sim: &SimulationState) {
-        let mut vertices = Vec::new();
+    pub fn update_uniforms(
+        &mut self,
+        queue: &wgpu::Queue,
+        camera: &Camera,
+        sim: &SimulationState,
+        width: f32,
+        height: f32,
+    ) {
+        let (forward, right, up, eye) = camera.get_vectors();
 
-        // 1. Render Black Hole event horizon as a dense point sphere/shell for visualization
-        let bh = &sim.black_hole;
-        let rs = bh.schwarzschild_radius;
-        // Generate points on sphere
-        let num_bh_points = 500;
-        for i in 0..num_bh_points {
-            let t = i as f32 / num_bh_points as f32;
-            let phi = t * std::f32::consts::PI;
-            let theta = t * 2.0 * std::f32::consts::PI * 13.0; // spiral-like
-            
-            let x = rs as f32 * phi.sin() * theta.cos();
-            let y = rs as f32 * phi.cos();
-            let z = rs as f32 * phi.sin() * theta.sin();
+        let uniforms = LensingUniforms {
+            camera_pos: [eye.x, eye.y, eye.z],
+            bh_mass: sim.black_hole.mass as f32,
+            camera_forward: [forward.x, forward.y, forward.z],
+            rs: sim.black_hole.schwarzschild_radius as f32,
+            camera_right: [right.x, right.y, right.z],
+            time: sim.time as f32,
+            camera_up: [up.x, up.y, up.z],
+            screen_width: width,
+            screen_height: height,
+            _pad: [0.0; 3],
+        };
 
-            vertices.push(ParticleVertex {
-                position: [x, y, z],
-                color: [0.03, 0.03, 0.03, 1.0], // Jet black horizon
-                size: 4.0,
-            });
-        }
-
-        // 2. Render Accretion Disk Particles
-        for p in &sim.accretion_disk.particles {
-            let t = p.temperature as f32;
-            let color = if t > 0.8 {
-                [1.0, 0.95, 0.9, 1.0] // bright yellowish white
-            } else if t > 0.4 {
-                let factor = (t - 0.4) / 0.4;
-                [1.0, 0.6 + 0.35 * factor, 0.1 * factor, 1.0] // Orange to yellow
-            } else {
-                let factor = t / 0.4;
-                [0.4 + 0.6 * factor, 0.05 + 0.25 * factor, 0.02, 1.0] // Dark red to orange
-            };
-
-            vertices.push(ParticleVertex {
-                position: [p.position.x as f32, p.position.y as f32, p.position.z as f32],
-                color,
-                size: 2.0,
-            });
-        }
-
-        // 3. Render Test Particles
-        for p in &sim.particles {
-            vertices.push(ParticleVertex {
-                position: [p.position.x as f32, p.position.y as f32, p.position.z as f32],
-                color: [0.4, 0.7, 1.0, 0.9], // light blue
-                size: 3.0,
-            });
-
-            // Also render trails
-            for (idx, trail_pos) in p.trail.iter().enumerate() {
-                let alpha = (idx as f32 / p.trail.len() as f32) * 0.3;
-                vertices.push(ParticleVertex {
-                    position: [trail_pos.x as f32, trail_pos.y as f32, trail_pos.z as f32],
-                    color: [0.4, 0.7, 1.0, alpha],
-                    size: 1.0,
-                });
-            }
-        }
-
-        self.vertex_count = vertices.len() as u32;
-
-        if self.vertex_count > 0 {
-            self.vertex_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Simulation Vertex Buffer"),
-                contents: bytemuck::cast_slice(&vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            }));
-        } else {
-            self.vertex_buffer = None;
-        }
+        queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
 }
